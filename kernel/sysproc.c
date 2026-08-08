@@ -77,10 +77,53 @@ sys_sleep(void)
 
 
 #ifdef LAB_PGTBL
-int
+uint64
 sys_pgaccess(void)
 {
-  // lab pgtbl: your code here.
+  uint64 base, pagebase, maskaddr;
+  int len;
+  uint32 mask = 0;
+  struct proc *p = myproc();
+
+  if(argaddr(0, &base) < 0 || argint(1, &len) < 0 ||
+     argaddr(2, &maskaddr) < 0)
+    return -1;
+
+  // The ABI counts pages.  malloc() may return an address within the first
+  // requested page, so align that address down before validating the range.
+  pagebase = PGROUNDDOWN(base);
+  if(len < 1 || len > 32 || base >= MAXVA || pagebase >= p->sz ||
+     (uint64)len * PGSIZE > p->sz - pagebase)
+    return -1;
+
+  // Validate the entire request before changing any accessed bits.
+  for(int i = 0; i < len; i++){
+    pte_t *pte = walk(p->pagetable, pagebase + (uint64)i * PGSIZE, 0);
+    if(pte == 0 || (*pte & (PTE_V | PTE_U)) != (PTE_V | PTE_U) ||
+       (*pte & (PTE_R | PTE_W | PTE_X)) == 0)
+      return -1;
+  }
+
+  // Build and publish the result before changing the observed PTEs.  A bad
+  // destination must not consume the access information.
+  for(int i = 0; i < len; i++){
+    pte_t *pte = walk(p->pagetable, pagebase + (uint64)i * PGSIZE, 0);
+    if(*pte & PTE_A)
+      mask |= (uint32)1 << i;
+  }
+  if(copyout(p->pagetable, maskaddr, (char *)&mask, sizeof(mask)) < 0)
+    return -1;
+
+  int flushed = 0;
+  for(int i = 0; i < len; i++){
+    pte_t *pte = walk(p->pagetable, pagebase + (uint64)i * PGSIZE, 0);
+    if(*pte & PTE_A){
+      *pte &= ~PTE_A;
+      flushed = 1;
+    }
+  }
+  if(flushed)
+    sfence_vma();
   return 0;
 }
 #endif

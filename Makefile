@@ -88,6 +88,12 @@ OBJDUMP = $(TOOLPREFIX)objdump
 
 CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb
 
+# GCC 13 diagnoses xv6's intentional recursive code paths as errors.
+GCC_MAJOR_VERSION := $(shell $(CC) -dumpversion | cut -d. -f1)
+ifeq ($(GCC_MAJOR_VERSION),13)
+CFLAGS += -Wno-error=infinite-recursion
+endif
+
 ifdef LAB
 LABUPPER = $(shell echo $(LAB) | tr a-z A-Z)
 XCFLAGS += -DSOL_$(LABUPPER) -DLAB_$(LABUPPER)
