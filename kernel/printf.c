@@ -121,9 +121,31 @@ panic(char *s)
   printf("panic: ");
   printf(s);
   printf("\n");
+  backtrace();
   panicked = 1; // freeze uart output from other CPUs
   for(;;)
     ;
+}
+
+// Print return addresses for frames in the current kernel-stack page.
+void
+backtrace(void)
+{
+  uint64 fp = r_fp();
+  uint64 bottom = PGROUNDDOWN(fp);
+  uint64 top = bottom + PGSIZE;
+
+  printf("backtrace:\n");
+  while(fp >= bottom + 16 && fp < top && (fp & 0xf) == 0){
+    uint64 ra = *(uint64 *)(fp - 8);
+    uint64 previous_fp = *(uint64 *)(fp - 16);
+
+    printf("%p\n", ra);
+    // Callers' frame pointers grow toward the top of this stack page.
+    if(previous_fp <= fp || previous_fp >= top || (previous_fp & 0xf) != 0)
+      break;
+    fp = previous_fp;
+  }
 }
 
 void

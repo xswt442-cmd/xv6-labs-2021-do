@@ -119,6 +119,11 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->alarm_interval = 0;
+  p->alarm_ticks = 0;
+  p->alarm_handler = 0;
+  p->in_handler = 0;
+  memset(&p->alarm_trapframe, 0, sizeof(p->alarm_trapframe));
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -163,6 +168,11 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  p->alarm_interval = 0;
+  p->alarm_ticks = 0;
+  p->alarm_handler = 0;
+  p->in_handler = 0;
+  memset(&p->alarm_trapframe, 0, sizeof(p->alarm_trapframe));
   p->state = UNUSED;
 }
 
@@ -294,6 +304,14 @@ fork(void)
 
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
+
+  // Inherit the alarm configuration, but start with an independent timer and
+  // never inherit a handler that was active in the parent.
+  np->alarm_interval = p->alarm_interval;
+  np->alarm_ticks = 0;
+  np->alarm_handler = p->alarm_handler;
+  np->in_handler = 0;
+  memset(&np->alarm_trapframe, 0, sizeof(np->alarm_trapframe));
 
   // increment reference counts on open file descriptors.
   for(i = 0; i < NOFILE; i++)

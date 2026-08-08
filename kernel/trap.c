@@ -76,6 +76,17 @@ usertrap(void)
   if(p->killed)
     exit(-1);
 
+  // Count only user-mode timer ticks while no alarm handler is active.
+  if(which_dev == 2 && p->alarm_interval > 0 && !p->in_handler){
+    p->alarm_ticks++;
+    if(p->alarm_ticks >= p->alarm_interval){
+      p->alarm_ticks = 0;
+      p->alarm_trapframe = *p->trapframe;
+      p->trapframe->epc = p->alarm_handler;
+      p->in_handler = 1;
+    }
+  }
+
   // give up the CPU if this is a timer interrupt.
   if(which_dev == 2)
     yield();
@@ -217,4 +228,3 @@ devintr()
     return 0;
   }
 }
-
