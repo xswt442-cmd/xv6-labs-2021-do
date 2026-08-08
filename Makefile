@@ -88,6 +88,13 @@ OBJDUMP = $(TOOLPREFIX)objdump
 
 CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb
 
+# GCC 13 diagnoses the intentionally recursive xv6 shell command runner.
+# Keep every other warning fatal, but let this one remain a warning.
+GCC_MAJOR := $(shell $(CC) -dumpversion 2>/dev/null | sed 's/\..*//')
+ifeq ($(GCC_MAJOR),13)
+CFLAGS += -Wno-error=infinite-recursion
+endif
+
 ifdef LAB
 LABUPPER = $(shell echo $(LAB) | tr a-z A-Z)
 XCFLAGS += -DSOL_$(LABUPPER) -DLAB_$(LABUPPER)

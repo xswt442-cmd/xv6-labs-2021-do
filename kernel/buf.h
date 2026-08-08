@@ -5,8 +5,8 @@ struct buf {
   uint blockno;
   struct sleeplock lock;
   uint refcnt;
-  struct buf *prev; // LRU cache list
-  struct buf *next;
+  uint bucket;      // bucket currently containing this buffer
+  uint timestamp;   // order of the most recent transition to refcnt == 0
+  struct buf *hnext;
   uchar data[BSIZE];
 };
-
