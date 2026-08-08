@@ -95,26 +95,94 @@ e1000_init(uint32 *xregs)
 int
 e1000_transmit(struct mbuf *m)
 {
-  //
-  // Your code here.
-  //
-  // the mbuf contains an ethernet frame; program it into
-  // the TX descriptor ring so that the e1000 sends it. Stash
-  // a pointer so that it can be freed after sending.
-  //
-  
+  acquire(&e1000_lock);
+
+  uint32 tail = regs[E1000_TDT];
+  struct tx_desc *desc = &tx_ring[tail];
+
+  // The device sets DD only after it no longer needs this descriptor or
+  // the mbuf recorded for it.
+  __sync_synchronize();
+  if ((desc->status & E1000_TXD_STAT_DD) == 0) {
+    release(&e1000_lock);
+    return -1;
+  }
+
+  if (tx_mbufs[tail])
+    mbuffree(tx_mbufs[tail]);
+
+  desc->addr = (uint64)m->head;
+  desc->length = m->len;
+  desc->cso = 0;
+  desc->cmd = E1000_TXD_CMD_EOP | E1000_TXD_CMD_RS;
+  desc->status = 0;
+  desc->css = 0;
+  desc->special = 0;
+  tx_mbufs[tail] = m;
+
+  // Make the descriptor visible before telling the device about it.
+  __sync_synchronize();
+  regs[E1000_TDT] = (tail + 1) % TX_RING_SIZE;
+
+  release(&e1000_lock);
   return 0;
 }
 
 static void
 e1000_recv(void)
 {
-  //
-  // Your code here.
-  //
-  // Check for packets that have arrived from the e1000
-  // Create and deliver an mbuf for each packet (using net_rx()).
-  //
+  struct mbuf *received = 0;
+  struct mbuf *received_tail = 0;
+
+  acquire(&e1000_lock);
+  uint32 index = (regs[E1000_RDT] + 1) % RX_RING_SIZE;
+  while (rx_ring[index].status & E1000_RXD_STAT_DD) {
+    struct rx_desc *desc = &rx_ring[index];
+    struct mbuf *old = rx_mbufs[index];
+
+    // DD is written by the device together with the remaining writeback
+    // fields, so don't consume those fields before observing it.
+    __sync_synchronize();
+    int good = (desc->status & E1000_RXD_STAT_EOP) &&
+      desc->errors == 0 && desc->length > 0 && desc->length <= MBUF_SIZE;
+    struct mbuf *replacement = good ? mbufalloc(0) : 0;
+
+    if (replacement) {
+      old->len = desc->length;
+      rx_mbufs[index] = replacement;
+      desc->addr = (uint64)replacement->head;
+    }
+
+    // On a bad frame, or when memory is exhausted, return the old buffer to
+    // the hardware.  It has not been handed to the network stack in either
+    // case, so it remains ours to recycle.
+    desc->length = 0;
+    desc->csum = 0;
+    desc->status = 0;
+    desc->errors = 0;
+    desc->special = 0;
+    __sync_synchronize();
+    regs[E1000_RDT] = index;
+
+    if (replacement) {
+      old->next = 0;
+      if (received_tail)
+        received_tail->next = old;
+      else
+        received = old;
+      received_tail = old;
+    }
+
+    index = (index + 1) % RX_RING_SIZE;
+  }
+  release(&e1000_lock);
+
+  // net_rx() can transmit replies, so do not invoke it holding e1000_lock.
+  while (received) {
+    struct mbuf *m = received;
+    received = m->next;
+    net_rx(m);
+  }
 }
 
 void
