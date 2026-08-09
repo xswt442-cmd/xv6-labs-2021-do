@@ -87,6 +87,9 @@ OBJCOPY = $(TOOLPREFIX)objcopy
 OBJDUMP = $(TOOLPREFIX)objdump
 
 CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb
+# GCC 13 diagnoses xv6's intentionally recursive shell dispatcher.  Keep all
+# other warnings fatal while accepting that well-established implementation.
+CFLAGS += $(shell $(CC) -Wno-error=infinite-recursion -E -x c /dev/null >/dev/null 2>&1 && echo -Wno-error=infinite-recursion)
 
 ifdef LAB
 LABUPPER = $(shell echo $(LAB) | tr a-z A-Z)
@@ -252,6 +255,11 @@ endif
 ifeq ($(LAB),net)
 UPROGS += \
 	$U/_nettests
+endif
+
+ifeq ($(LAB),mmap)
+UPROGS += \
+	$U/_mmaptest
 endif
 
 UEXTRA=

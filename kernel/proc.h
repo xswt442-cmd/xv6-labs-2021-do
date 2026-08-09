@@ -18,6 +18,19 @@ struct context {
   uint64 s11;
 };
 
+struct file;
+
+// A file-backed user mapping.  length is always page-aligned.
+struct vma {
+  uint64 addr;
+  uint64 length;       // page-rounded virtual length
+  uint64 file_length;  // requested byte length still represented by the VMA
+  uint64 offset;
+  int prot;
+  int flags;
+  struct file *file;
+};
+
 // Per-CPU state.
 struct cpu {
   struct proc *proc;          // The process running on this cpu, or null.
@@ -104,5 +117,6 @@ struct proc {
   struct context context;      // swtch() here to run process
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
+  struct vma vma[NVMA];        // File-backed mappings
   char name[16];               // Process name (debugging)
 };

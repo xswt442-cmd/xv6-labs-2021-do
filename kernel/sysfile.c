@@ -53,6 +53,43 @@ fdalloc(struct file *f)
 }
 
 uint64
+sys_mmap(void)
+{
+  uint64 addr, length, offset;
+  int prot, flags;
+  struct file *f;
+
+  if(argaddr(0, &addr) < 0 || argaddr(1, &length) < 0 ||
+     argint(2, &prot) < 0 || argint(3, &flags) < 0 ||
+     argfd(4, 0, &f) < 0 || argaddr(5, &offset) < 0)
+    return -1;
+  // xv6's mmap ABI is intentionally small: the kernel chooses a high hole,
+  // the file offset is page-aligned, and only one map mode is meaningful at
+  // a time. The requested byte length is rounded internally to whole pages.
+  if(addr != 0 || length == 0 || length > ~0ULL - (PGSIZE - 1) ||
+     offset != 0 || offset + length < offset ||
+     offset + length > 0xffffffffUL || prot == PROT_NONE ||
+     (prot & ~(PROT_READ | PROT_WRITE)) ||
+     (flags != MAP_SHARED && flags != MAP_PRIVATE) ||
+     f->type != FD_INODE || !f->readable ||
+     ((flags & MAP_SHARED) && (prot & PROT_WRITE) && !f->writable))
+    return -1;
+
+  uint64 mapped = vma_map(myproc(), length, offset, prot, flags, f);
+  return mapped ? mapped : (uint64)-1;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr, length;
+
+  if(argaddr(0, &addr) < 0 || argaddr(1, &length) < 0)
+    return -1;
+  return vma_unmap(myproc(), addr, length);
+}
+
+uint64
 sys_dup(void)
 {
   struct file *f;

@@ -5,6 +5,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
+#include "fcntl.h"
 
 struct cpu cpus[NCPU];
 
@@ -19,6 +23,284 @@ extern void forkret(void);
 static void freeproc(struct proc *p);
 
 extern char trampoline[]; // trampoline.S
+
+static struct vma*
+findvma(struct proc *p, uint64 va)
+{
+  for(int i = 0; i < NVMA; i++){
+    struct vma *v = &p->vma[i];
+    if(v->length && va >= v->addr && va < v->addr + v->length)
+      return v;
+  }
+  return 0;
+}
+
+static uint64
+vma_lowest_addr(struct proc *p)
+{
+  uint64 low = TRAPFRAME;
+
+  for(int i = 0; i < NVMA; i++)
+    if(p->vma[i].length && p->vma[i].addr < low)
+      low = p->vma[i].addr;
+  return low;
+}
+
+// Choose the highest available hole below the trapframe.  Mappings are kept
+// outside p->sz, so heap growth and mmap never silently overlap.
+uint64
+vma_map(struct proc *p, uint64 length, uint64 offset, int prot, int flags,
+        struct file *file)
+{
+  struct vma *slot = 0;
+  uint64 end = TRAPFRAME;
+  uint64 requested = length;
+
+  if(length == 0 || length > ~0ULL - (PGSIZE - 1))
+    return 0;
+  length = PGROUNDUP(length);
+
+  for(int i = 0; i < NVMA; i++){
+    if(p->vma[i].length == 0 && slot == 0)
+      slot = &p->vma[i];
+  }
+  if(slot == 0 || length == 0 || length > TRAPFRAME)
+    return 0;
+
+  for(;;){
+    if(end < length)
+      return 0;
+    uint64 start = end - length;
+    if(start < PGROUNDUP(p->sz))
+      return 0;
+
+    int overlap = 0;
+    for(int i = 0; i < NVMA; i++){
+      struct vma *v = &p->vma[i];
+      if(v->length && start < v->addr + v->length && end > v->addr){
+        end = v->addr;
+        overlap = 1;
+        break;
+      }
+    }
+    if(!overlap){
+      slot->addr = start;
+      slot->length = length;
+      slot->file_length = requested;
+      slot->offset = offset;
+      slot->prot = prot;
+      slot->flags = flags;
+      slot->file = filedup(file);
+      return start;
+    }
+  }
+}
+
+// Write a resident shared page back using its VMA-relative file offset.
+// This deliberately does not use filewrite(): a mapping must not alter f->off.
+static int
+vma_writeback_page(struct proc *p, struct vma *v, uint64 va)
+{
+  pte_t *pte = walk(p->pagetable, va, 0);
+  uint64 off = v->offset + va - v->addr;
+  uint64 pa;
+  uint64 delta = va - v->addr;
+  uint64 remaining;
+  int done = 0;
+  int total;
+  uint file_size;
+  int max = ((MAXOPBLOCKS-1-1-2) / 2) * BSIZE;
+
+  if(pte == 0 || (*pte & PTE_V) == 0)
+    return 0;
+  if(delta >= v->file_length)
+    return 0;
+  remaining = v->file_length - delta;
+  total = remaining < PGSIZE ? (int)remaining : PGSIZE;
+  ilock(v->file->ip);
+  file_size = v->file->ip->size;
+  iunlock(v->file->ip);
+  if(off >= file_size)
+    return 0;
+  if(total > file_size - off)
+    total = file_size - off;
+  pa = PTE2PA(*pte);
+  while(done < total){
+    int n = total - done;
+    int r;
+    if(n > max)
+      n = max;
+    begin_op();
+    ilock(v->file->ip);
+    r = writei(v->file->ip, 0, pa + done, (uint)(off + done), n);
+    iunlock(v->file->ip);
+    end_op();
+    if(r != n)
+      return -1;
+    done += n;
+  }
+  return 0;
+}
+
+static int
+vma_release(struct proc *p, struct vma *v, uint64 addr, uint64 length)
+{
+  int err = 0;
+
+  for(uint64 va = addr; va < addr + length; va += PGSIZE){
+    pte_t *pte = walk(p->pagetable, va, 0);
+    if(pte && (*pte & PTE_V)){
+      if((v->flags & MAP_SHARED) && (v->prot & PROT_WRITE) &&
+         vma_writeback_page(p, v, va) < 0)
+        err = -1;
+      uvmunmap(p->pagetable, va, 1, 1);
+    }
+  }
+  return err;
+}
+
+int
+vma_unmap(struct proc *p, uint64 addr, uint64 length)
+{
+  struct vma *v;
+  uint64 end;
+  int err;
+
+  if(length == 0 || (addr % PGSIZE) ||
+     length > ~0ULL - (PGSIZE - 1))
+    return -1;
+  length = PGROUNDUP(length);
+  if((end = addr + length) < addr)
+    return -1;
+  if((v = findvma(p, addr)) == 0 || end > v->addr + v->length)
+    return -1;
+  // The lab interface permits only removal from either end of one VMA.
+  if(addr != v->addr && end != v->addr + v->length)
+    return -1;
+
+  err = vma_release(p, v, addr, length);
+  if(addr == v->addr && end == v->addr + v->length){
+    fileclose(v->file);
+    memset(v, 0, sizeof(*v));
+  } else if(addr == v->addr){
+    v->addr = end;
+    v->offset += length;
+    v->length -= length;
+    v->file_length = v->file_length > length ?
+                     v->file_length - length : 0;
+  } else {
+    v->length -= length;
+    if(v->file_length > v->length)
+      v->file_length = v->length;
+  }
+  sfence_vma();
+  return err;
+}
+
+void
+vma_cleanup(struct proc *p)
+{
+  for(int i = 0; i < NVMA; i++){
+    struct vma *v = &p->vma[i];
+    if(v->length){
+      vma_release(p, v, v->addr, v->length);
+      fileclose(v->file);
+      memset(v, 0, sizeof(*v));
+    }
+  }
+  sfence_vma();
+}
+
+int
+vma_fault(struct proc *p, uint64 va, uint64 cause)
+{
+  struct vma *v;
+  uint64 page = PGROUNDDOWN(va);
+  uint64 fileoff;
+  uint64 delta;
+  int perm = PTE_U;
+  char *mem;
+  int n;
+
+  if((v = findvma(p, page)) == 0)
+    return -1;
+  if((cause == 13 && !(v->prot & PROT_READ)) ||
+     (cause == 15 && !(v->prot & PROT_WRITE)) ||
+     (cause == 12 && !(v->prot & PROT_EXEC)))
+    return -1;
+  if(v->prot & PROT_READ)
+    perm |= PTE_R;
+  if(v->prot & PROT_WRITE)
+    // RISC-V reserves writable leaf PTEs that are not also readable.
+    perm |= PTE_R | PTE_W;
+  if(v->prot & PROT_EXEC)
+    perm |= PTE_X;
+  if(walk(p->pagetable, page, 0) && (*walk(p->pagetable, page, 0) & PTE_V))
+    return -1;
+  if((mem = kalloc()) == 0)
+    return -1;
+  memset(mem, 0, PGSIZE);
+  delta = page - v->addr;
+  fileoff = v->offset + delta;
+  n = 0;
+  if(delta < v->file_length){
+    uint64 remain = v->file_length - delta;
+    int want = remain < PGSIZE ? remain : PGSIZE;
+    ilock(v->file->ip);
+    n = readi(v->file->ip, 0, (uint64)mem, (uint)fileoff, want);
+    iunlock(v->file->ip);
+  }
+  if(n < 0 || mappages(p->pagetable, page, PGSIZE, (uint64)mem, perm) < 0){
+    kfree(mem);
+    return -1;
+  }
+  sfence_vma();
+  return 0;
+}
+
+int
+vma_fork(struct proc *p, struct proc *np)
+{
+  for(int i = 0; i < NVMA; i++){
+    struct vma *v = &p->vma[i];
+    struct vma *nv = &np->vma[i];
+    if(v->length == 0)
+      continue;
+    *nv = *v;
+    nv->file = filedup(v->file);
+    for(uint64 va = v->addr; va < v->addr + v->length; va += PGSIZE){
+      pte_t *pte = walk(p->pagetable, va, 0);
+      char *mem;
+      if(pte == 0 || (*pte & PTE_V) == 0)
+        continue;
+      if((mem = kalloc()) == 0)
+        goto bad;
+      memmove(mem, (char *)PTE2PA(*pte), PGSIZE);
+      if(mappages(np->pagetable, va, PGSIZE, (uint64)mem, PTE_FLAGS(*pte)) < 0){
+        kfree(mem);
+        goto bad;
+      }
+    }
+  }
+  return 0;
+
+bad:
+  // np is not visible yet and its lock is held.  Tear down copied pages and
+  // references without file-system writeback, which could sleep here.
+  for(int i = 0; i < NVMA; i++){
+    struct vma *v = &np->vma[i];
+    if(v->length){
+      for(uint64 va = v->addr; va < v->addr + v->length; va += PGSIZE){
+        pte_t *pte = walk(np->pagetable, va, 0);
+        if(pte && (*pte & PTE_V))
+          uvmunmap(np->pagetable, va, 1, 1);
+      }
+      fileclose(v->file);
+      memset(v, 0, sizeof(*v));
+    }
+  }
+  return -1;
+}
 
 // helps ensure that wakeups of wait()ing
 // parents are not lost. helps obey the
@@ -163,6 +445,7 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  memset(p->vma, 0, sizeof(p->vma));
   p->state = UNUSED;
 }
 
@@ -252,16 +535,23 @@ userinit(void)
 int
 growproc(int n)
 {
-  uint sz;
+  uint64 sz, newsz, limit;
   struct proc *p = myproc();
 
   sz = p->sz;
   if(n > 0){
-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+    newsz = sz + (uint)n;
+    limit = vma_lowest_addr(p);
+    if(newsz < sz || newsz > limit || newsz >= TRAPFRAME)
+      return -1;
+    if((sz = uvmalloc(p->pagetable, sz, newsz)) == 0) {
       return -1;
     }
   } else if(n < 0){
-    sz = uvmdealloc(p->pagetable, sz, sz + n);
+    uint64 shrink = (uint64)(-(long)n);
+    if(shrink > sz)
+      return -1;
+    sz = uvmdealloc(p->pagetable, sz, sz - shrink);
   }
   p->sz = sz;
   return 0;
@@ -288,6 +578,12 @@ fork(void)
     return -1;
   }
   np->sz = p->sz;
+
+  if(vma_fork(p, np) < 0){
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
@@ -343,6 +639,8 @@ exit(int status)
 
   if(p == initproc)
     panic("init exiting");
+
+  vma_cleanup(p);
 
   // Close all open files.
   for(int fd = 0; fd < NOFILE; fd++){
